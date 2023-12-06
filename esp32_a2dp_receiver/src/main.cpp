@@ -7,16 +7,23 @@
 #include "BluetoothA2DPSink.h"
 #include <BlockNot.h>
 
+#include <SAAB_ICM2.h>
+#include <saab_icm2_font.h>
+#include <myBitmap.h>
+
 BluetoothA2DPSink a2dp_sink;
 
 // -------------------CONFIGURATION-------------------
+// Should be stored in a seperate file, for if user wants to change settings. with the help of a config file, we can also add more features, like a menu to change settings, or a menu to change the display layout.
+// big idea's for the future, but for now, we'll just use this to change settings.
+
 // Enable steering wheel controls via CAN
 #define USE_CAN
 
 // Enable auto-switching to Aux with the help of SID CAN-UART
 // Auto-switching only happens when we are connected to Bluetooth
 // Requires USE_CAN
-#define USE_SID_UART
+//#define USE_SID_UART
 
 // Enable Bluetooth auto-reconnect
 #define BT_AUTO_RECONNECT
@@ -27,7 +34,25 @@ BluetoothA2DPSink a2dp_sink;
 
 // Swap left/right audio channels due to this bug: https://github.com/espressif/esp-idf/issues/3399
 #define SWAP_LR
+
+// Enable ICM2 display usage, displays track info etc. when playing audio.
+// requires ICM2 hardware 
+// might** negate the need for USE_SID_UART? possible to use original ICM2 display signals for Aux mode detection.
+// not possible when using ICM1 hardware, as ICM1 hardware does not have a display. or ICM3 as I am competely unfamilliar with it
+// **Future work
+#define USE_ICM2
+
+// Enable internal DAC
+// If not enabled, external DAC is used
+// If enabled, internal DAC is used
+// Internal DAC is not as good as external DAC, but it is good enough for testing purposes (without having a DAC)
+#define INTERAL_DAC
 // ---------------------------------------------------
+
+#ifdef USE_ICM2
+SAAB_ICM2 display = SAAB_ICM2();
+#endif
+
 
 #ifdef USE_CAN
 struct can_frame canMsg;
@@ -50,18 +75,35 @@ BlockNot ibusDelay(1000);
 
 // I2S Pins
 // ws_io_num => GPIO 25,
-// data_out_num => GPIO 22
+// data_out_num => GPIO 14
 // bck_io_num => GPIO 26,
 int mutePin = 2;
 
 int inCall;
 
+String currentContent = "";
+String lastContent = "";
+
 // Metadata
 // 0x1 - Song Title
 // 0x2 - Artist
 // 0x4 - Album
+// 0x8 - ?
+// 0x10 - ?
+// 0x20 - ?
 void avrc_metadata_callback(uint8_t data1, const uint8_t *data2) {
   Serial.printf("AVRC metadata rsp: attribute id 0x%x, %s\n", data1, data2);
+  switch(data1){
+    case 0x1:
+      currentContent = (char*)data2;
+      break;
+    case 0x2:
+      currentContent = currentContent + " by " + (char*)data2;
+      break;
+    case 0x4:
+      currentContent = currentContent + " - " + (char*)data2;
+      break;
+  }
 }
 
 void connection_state_changed(esp_a2d_connection_state_t state, void *ptr){
@@ -264,19 +306,75 @@ void setup() {
   //pinMode(TXD2, OUTPUT);
 #endif
 
+#ifdef USE_ICM2
+  // Setup ICM2 display
+  Wire.begin();
+  Wire.setClock(2000000);
+
+  if (!display.begin())
+  {
+    Serial.println(F("ICM2 begin() failed"));
+    for (;;)
+    {
+    }
+  }
+
+  display.clearDisplay();
+  display.setFont(&saab_icm2_font);
+  display.setTextSize(1);
+  display.setTextWrap(false); // True is broken for some reason
+  display.setTextColor(ICM2_ON);
+  display.display();
+  Serial.println("ICM2 Blanked!");
+
+#endif
+
   // Setup UDA1334A DAC
   static const i2s_config_t i2s_config = {
+    #ifndef INTERAL_DAC
     .mode = (i2s_mode_t) (I2S_MODE_MASTER | I2S_MODE_TX),
+    #endif
+    #ifdef INTERAL_DAC
+    .mode = (i2s_mode_t) (I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN),
+    #endif
       .sample_rate = 44100,
+      
+      #ifndef INTERAL_DAC
       .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+      #endif
+      #ifdef INTERAL_DAC
+      .bits_per_sample = (i2s_bits_per_sample_t) 16,
+      #endif
+
       .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+      
+      #ifndef INTERAL_DAC
       .communication_format = (i2s_comm_format_t) (I2S_COMM_FORMAT_STAND_I2S),
+      #endif
+      #ifdef INTERAL_DAC
+      .communication_format = (i2s_comm_format_t)I2S_COMM_FORMAT_STAND_MSB,
+      #endif
+
       .intr_alloc_flags = 0, // default interrupt priority
       .dma_buf_count = 8,
+      
+      #ifndef INTERAL_DAC
       .dma_buf_len = 120,
+      #endif
+      #ifdef INTERAL_DAC
+      .dma_buf_len = 65,
+      #endif
+
       .use_apll = true,
       .tx_desc_auto_clear = true
     };
+  const i2s_pin_config_t dac_pin_config = {
+    .bck_io_num = 26,
+    .ws_io_num = 25,
+    .data_out_num = 14,
+    .data_in_num = I2S_PIN_NO_CHANGE
+  };
+  a2dp_sink.set_pin_config(dac_pin_config);
   a2dp_sink.set_i2s_config(i2s_config);
 
   // Setup INMP441 Microphone
@@ -297,7 +395,7 @@ void setup() {
     .bck_io_num = 16,
     .ws_io_num = 17,
     .data_out_num = -1,
-    .data_in_num = 21
+    .data_in_num = 19
   };
   i2s_set_pin(I2S_NUM_1, &mic_pin_config);
 
@@ -333,15 +431,34 @@ void setup() {
   Serial.println("BT STACK UP!");
 }
 
+bool DrawBitmapOnce = false;
 bool muteState = false;
 bool playingStateRequest = true;
-bool playingState = false;
+bool playingState = NULL;
+bool lastState = NULL;
 
-String lastContent = "";
+//String lastContent = "";
 
 long playTime = 0;
 
 void loop() {
+  // Update ICM2 display
+  // displays splash screen for delay time, then clears display
+  #ifdef USE_ICM2
+    if(!DrawBitmapOnce){
+    display.drawBitmap(0,1,myBitmap3,display.width(),display.height(),ICM2_ON);
+    display.display();
+    Serial.println("ICM2 Bitmap!");
+    DrawBitmapOnce = true;
+    BlockNot i2c_delay(2000);
+
+    while(!i2c_delay.TRIGGERED);
+    display.clearDisplay();
+    display.display();
+    Serial.println("ICM2 Delay Triggered!");
+    }
+  #endif
+  
   // If not connected to Bluetooth
   if (a2dp_sink.get_connection_state() != ESP_A2D_CONNECTION_STATE_CONNECTED)
   {
@@ -351,17 +468,28 @@ void loop() {
     muteState = true;
     playingState = false;
 
-#ifdef USE_SID_UART
+    #ifdef USE_SID_UART
     // If not connected to Bluetooth, reset Aux auto-switch loop
     doOnce = 0;
-#endif
+    #endif
 
     return;
   }
   // If connected to Bluetooth
   else
   {
-#ifdef USE_SID_UART
+    if (a2dp_sink.get_audio_state() == 2)
+    {
+      lastState = playingState;
+      playingState = true;
+    }
+    else if (a2dp_sink.get_audio_state() != 2)
+    {
+      lastState = playingState;
+      playingState = false;
+    }
+
+    #ifdef USE_SID_UART
     if(Serial2.available()){
       // read the incoming byte:
       char d = Serial2.read();
@@ -378,17 +506,19 @@ void loop() {
             auxPlayMatchIndex = 0;
 
             // Play audio
-#ifdef RESUME_AUDIO_ON_CONNECTION
-            a2dp_sink.play();
-            Serial.println("Playing audio");
-#endif
+            #ifdef RESUME_AUDIO_ON_CONNECTION
+              a2dp_sink.play();
+              Serial.println("Playing audio");
+            #endif
 
             // Stop the loop
             doOnce = 1;
-          }else{
+          }
+          else{
             auxPlayMatchIndex++;
           }
-        }else{
+        }
+        else{
           auxPlayMatchIndex = 0;
 
           // Send SRC button press message via I-BUS every second until we are in Aux mode
@@ -399,8 +529,8 @@ void loop() {
         }
       }
     }
-#endif
-
+    #endif
+    
     // Wait until playing again
     if (playingState)
     {
@@ -417,92 +547,119 @@ void loop() {
 
 
 
-// Read messages
-// 
-// CAN database can be found here:
-// https://www.trionictuning.com/forum/viewtopic.php?f=46&t=5763
-#ifdef USE_CAN
-  if (mcp2515.readMessage(&canMsg) == MCP2515::ERROR_OK)
-  {
-    if (canMsg.can_id == 0x290)
+  // Read messages
+  // 
+  // CAN database can be found here:
+  // https://www.trionictuning.com/forum/viewtopic.php?f=46&t=5763
+  #ifdef USE_CAN
+    if (mcp2515.readMessage(&canMsg) == MCP2515::ERROR_OK)
     {
-      int btnData = canMsg.data[3];
-
-      switch (btnData)
+      if (canMsg.can_id == 0x290)
       {
-      case 0x0:
-        // Nothing!
-        break;
-      case 0x5:
-        Serial.println("NEXT");
-        a2dp_sink.next();
-        //NEXT
-        break;
-      case 0x6:
-        Serial.println("PREV");
-        a2dp_sink.previous();
-        //PREV
-        break;
-      case 0x11:
-        Serial.println("PLAY/PAUSE");
-        if (playingStateRequest)
-        {
-          a2dp_sink.pause();
-        }
-        else
-        {
-          a2dp_sink.play();
-        }
-        // Update the boolean
-        playingStateRequest = !playingStateRequest;
-        //PLAY/PAUSE
-        break;
+        int btnData = canMsg.data[3];
 
-      // ESP HF Client
-      // https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/bluetooth/esp_hf_client.html
-      //
-      // Voice Recognition
-      case 0x04:
-        Serial.println("VOICE REQ");
-        esp_hf_client_start_voice_recognition();
-        break;
-      // Answer/reject phone call
-      case 0x12:
-        if(inCall == 0)
+        switch (btnData)
         {
-          Serial.println("ANSWER CALL");
-          esp_hf_client_answer_call();
+        case 0x0:
+          // Nothing!
           break;
-        }
-        if(inCall == 1)
-        {
-          Serial.println("REJECT CALL");
-          esp_hf_client_reject_call();
+        case 0x5:
+          Serial.println("NEXT");
+          a2dp_sink.next();
+          //NEXT
           break;
+        case 0x6:
+          Serial.println("PREV");
+          a2dp_sink.previous();
+          //PREV
+          break;
+        case 0x11:
+          Serial.println("PLAY/PAUSE");
+          if (playingStateRequest)
+          {
+            a2dp_sink.pause();
+          }
+          else
+          {
+            a2dp_sink.play();
+          }
+          // Update the boolean
+          playingStateRequest = !playingStateRequest;
+          //PLAY/PAUSE
+          break;
+
+        // ESP HF Client
+        // https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/bluetooth/esp_hf_client.html
+        //
+        // Voice Recognition
+        case 0x04:
+          Serial.println("VOICE REQ");
+          esp_hf_client_start_voice_recognition();
+          break;
+        // Answer/reject phone call
+        case 0x12:
+          if(inCall == 0)
+          {
+            Serial.println("ANSWER CALL");
+            esp_hf_client_answer_call();
+            break;
+          }
+          if(inCall == 1)
+          {
+            Serial.println("REJECT CALL");
+            esp_hf_client_reject_call();
+            break;
+          }
         }
       }
     }
-  }
 
-  // If playing content
-  if (a2dp_sink.get_audio_state() == 2)
-  {
-    playingState = true;
-    // Determine full screen refresh
-    String currentContent = "";
-
-    //currentContent = a2dp_sink.audio_trackname + " - " + a2dp_sink.audio_trackalbum + " by " + a2dp_sink.audio_trackartist + " : " + a2dp_sink.audio_tracklength;
-
-    // Do full refresh
-    if (currentContent != lastContent)
+    // If playing content
+    if (playingState)
     {
-      lastContent = currentContent;
-      Serial.println(currentContent);
+      // Determine full screen refresh
+      //String currentContent = "";
+
+      //currentContent = a2dp_sink.audio_trackname + " - " + a2dp_sink.audio_trackalbum + " by " + a2dp_sink.audio_trackartist + " : " + a2dp_sink.audio_tracklength;
+
+      // Do full refresh
+      if (currentContent != lastContent)
+      {
+        lastContent = currentContent;
+        #ifdef USE_ICM2
+          display.clearDisplay();
+          display.setCursor(2, 10);
+          display.println("Playing:");
+          display.println(currentContent);
+          Serial.print("\nICM2 Display Updated!" + currentContent);
+          display.display();
+        #endif
+      }
+      else if (playingState != lastState)
+      {
+        #ifdef USE_ICM2
+          display.clearDisplay();
+          display.setCursor(2, 10);
+          display.println("Playing:");
+          display.println(currentContent);
+          Serial.println("\nICM2 Display Updated!" + currentContent);
+          display.display();
+        #endif
+      }
     }
-  }
-  else
-  {
-    playingState = false;
-  }
+    else
+    {
+      if (playingState != lastState)
+      {
+          #ifdef USE_ICM2
+            display.clearDisplay();
+            display.setCursor(2, 10);
+            display.println("Paused:");
+            display.println(currentContent);
+            Serial.println("\nICM2 Display Updated!" + currentContent);
+            display.display();
+          #endif
+      }
+    }
   #endif
 }
